@@ -5,43 +5,57 @@ import os
 import sys
 import time
 import numpy as np
-import visor.image as vsr_img
+import json
+import visor.image as vsri
 import numcodecs
+from pprint import pprint
 from numcodecs_ffmpeg import ffmpeg_codec
 
 def compress_dataset(visor_path, img_tags, compressor, overwrite=False):
     """Compress whole visor image dataset"""
     # TODO: with filter
 
-    vimg_r = vsr_img.open_vsr(visor_path, 'r')
+    _img_type = 'raw'
+
+    vimg_r = vsri.open_vsr(visor_path, 'r')
     img_info = vimg_r.info
     selected = vimg_r.image_files['raw']
 
-    vimg_c = vsr_img.open_vsr(visor_path, 'w')
+    vimg_w = vsri.open_vsr(visor_path, 'w')
 
     # loop through all the slices
     for slice_fc in selected:
         print('Processing', slice_fc['path'])
+
+        # read resolution info from the slice
         slice_name = slice_fc['path'].split('.')[0]
-        res_id = 0  # TODO: loop over resolutions
-        varr = vimg_r.read(
-            img_type='raw',
-            zarr_file=f'{slice_name}.zarr',
-            resolution=res_id)
+        meta_file = os.path.join(visor_path, f'visor_{_img_type}_images', slice_fc['path'], '.zattrs')
+        with open(meta_file) as mf:
+            vinfo = json.load(mf)
+        res_s = vinfo['multiscales'][0]['datasets']
+        pprint(res_s)
 
-        # metadata
-        arr_info = varr.info
-        arr_info['multiscales'][0]['datasets'] = [varr.info['multiscales'][0]['datasets'][res_id]]
-        arr_info['sources'] = [slice_fc]
+        for res_idx, res_info in enumerate(res_s):
+            res_id = res_info['path']
+            varr = vimg_r.read(
+                img_type='raw',
+                zarr_file=f'{slice_name}.zarr',
+                resolution=res_id)
 
-        slice_name_c = f'{img_tags["person"]}_{slice_name}_{img_tags["date"]}'
+            # metadata
+            arr_info = varr.info
+            #arr_info['multiscales'][0]['datasets'] = [varr.info['multiscales'][0]['datasets'][res_idx]]
+            arr_info['sources'] = [slice_fc]
 
-        vimg_c.write(
-            arr = varr.array, img_type = 'compr',
-            file = slice_name_c, resolution = res_id,
-            img_info=img_info, arr_info=arr_info, selected=selected,
-            compressor=compressor,
-            overwrite=overwrite)
+            #slice_name_c = f'{img_tags["person"]}_{slice_name}_{img_tags["date"]}'
+            slice_name_c = f'{img_tags["person"]}_{slice_name}_20250417'
+
+            vimg_w.write(
+                arr = varr.array, img_type = 'compr',
+                file = slice_name_c, resolution = int(res_id),
+                img_info=img_info, arr_info=arr_info, selected=selected,
+                compressor=compressor,
+                overwrite=overwrite)
 
 def get_total_size(directory):
     total_size = 0
@@ -172,7 +186,7 @@ def calculate_psnr(img1, img2):
 def test_err(visor_path):
     """Test error between raw and compressed images using PSNR."""
     # Open both raw and compressed images
-    vimg_raw = vsr_img.open_vsr(visor_path, 'r')
+    vimg_raw = vsri.open_vsr(visor_path, 'r')
     selected = vimg_raw.image_files['raw']
     
     # Statistics storage
@@ -193,7 +207,8 @@ def test_err(visor_path):
         
         # Read compressed image
         hostname = os.uname().nodename
-        date = time.strftime("%Y%m%d")
+        #date = time.strftime("%Y%m%d")
+        date = '20250417'
         slice_name_c = f'{hostname}_{slice_name}_{date}'
         try:
             varr_comp = vimg_raw.read(
@@ -235,13 +250,13 @@ if __name__ == '__main__':
     overwrite = True
 
     img_tags = {
-        'person': os.uname().nodename, # hostname
+        'person': os.uname().nodename,  # hostname
         'date': time.strftime("%Y%m%d") # current date
     }
 
     print(f'Compressor: {compressor}')
     t1 = time.time()
-    #compress_dataset(visor_path, img_tags, compressor, overwrite)
+    compress_dataset(visor_path, img_tags, compressor, overwrite)
     t2 = time.time()
     print("File path:", visor_path)
     evaluation(visor_path, t2-t1)

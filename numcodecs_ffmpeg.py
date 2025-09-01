@@ -85,6 +85,12 @@ class ffmpeg_codec(numcodecs.abc.Codec):
 
             # lossless option
             #'x265-params': 'lossless=1'
+            
+            # disables lookahead slices (1), or enable it (0)
+            'x265-params': 'no-lookahead-slices=1',
+
+            # manually set lookahead slices
+            #'x265-params': 'lookahead-slices=0:rc-lookahead=20',
         }
         if kwargs:
             self.conf.update(kwargs)
