@@ -17,20 +17,16 @@
 
 import sys
 import re
+from typing import Any, cast
+
 import numpy as np
 import numcodecs
 import ffmpeg
-
-ZARR_V3_IMPORT_ERROR = None
-BytesBytesCodec = None
-try:
-    from zarr.abc.codec import BytesBytesCodec
-    from zarr.core.common import parse_named_configuration
-    from zarr.registry import register_codec as register_zarr_codec
-except Exception as exc:  # pragma: no cover - environment-dependent import
-    ZARR_V3_IMPORT_ERROR = exc
-    parse_named_configuration = None
-    register_zarr_codec = None
+from numcodecs.abc import Codec as NumcodecsCodec
+from numcodecs.registry import register_codec as register_numcodecs_codec
+from zarr.abc.codec import BytesBytesCodec
+from zarr.core.common import parse_named_configuration
+from zarr.registry import register_codec as register_zarr_codec
 
 
 def _build_debug_hooks(debug_mode):
@@ -131,6 +127,8 @@ def _decode_array_with_ffmpeg(buf, dbg_print, err_print):
 
 def _chunk_spec_to_numpy_dtype(chunk_spec):
     dtype = getattr(chunk_spec, 'dtype', None)
+    if dtype is None:
+        raise TypeError('chunk spec is missing dtype metadata')
     if hasattr(dtype, 'to_native_dtype'):
         dtype = dtype.to_native_dtype()
     return np.dtype(dtype)
@@ -163,7 +161,13 @@ def _array_to_chunk_bytes(chunk_array, chunk_spec):
         chunk_array = chunk_array.reshape(shape)
     return chunk_spec.prototype.buffer.from_bytes(chunk_array.tobytes(order='C'))
 
-class ffmpeg_codec(numcodecs.abc.Codec):
+
+def _dtype_to_numpy_dtype(dtype):
+    native_dtype = dtype.to_native_dtype() if hasattr(dtype, 'to_native_dtype') else dtype
+    return np.dtype(cast(Any, native_dtype))
+
+
+class ffmpeg_codec(NumcodecsCodec):
     """
     Codec based on FFMPEG for 3D array of dtype uint16.
 
@@ -272,81 +276,78 @@ class ffmpeg_codec(numcodecs.abc.Codec):
         #        c.conf[k] = conf[k]
         return c
 
+_parse_named_configuration = cast(Any, parse_named_configuration)
 
-if BytesBytesCodec is not None:
-    class ffmpeg_codec_v3(BytesBytesCodec):
-        """Zarr v3 bytes-to-bytes codec wrapping the FFmpeg chunk transform."""
 
-        codec_name = "ffmpeg"
-        is_fixed_size = False
+class ffmpeg_codec_v3(BytesBytesCodec):
+    """Zarr v3 bytes-to-bytes codec wrapping the FFmpeg chunk transform."""
 
-        def __init__(self, *, debug_mode=0, **kwargs):
-            self.conf = dict(ffmpeg_codec().conf)
-            if kwargs:
-                self.conf.update(kwargs)
-            self.debug_mode = debug_mode
-            self.dbg_print, self.err_print = _build_debug_hooks(self.debug_mode)
+    codec_name = "ffmpeg"
+    is_fixed_size = False
 
-        @classmethod
-        def from_dict(cls, data):
-            _, configuration = parse_named_configuration(
-                data,
-                cls.codec_name,
-                require_configuration=False,
-            )
-            configuration = dict(configuration or {})
-            debug_mode = int(configuration.pop('debug_mode', 0))
-            return cls(debug_mode=debug_mode, **configuration)
+    def __init__(self, *, debug_mode=0, **kwargs):
+        self.conf = dict(ffmpeg_codec().conf)
+        if kwargs:
+            self.conf.update(kwargs)
+        self.debug_mode = debug_mode
+        self.dbg_print, self.err_print = _build_debug_hooks(self.debug_mode)
 
-        def to_dict(self):
-            configuration = dict(self.conf)
-            if self.debug_mode != 0:
-                configuration['debug_mode'] = self.debug_mode
-            return {
-                'name': self.codec_name,
-                'configuration': configuration,
-            }
+    @classmethod
+    def from_dict(cls, data):
+        _, configuration = _parse_named_configuration(
+            data,
+            cls.codec_name,
+            require_configuration=False,
+        )
+        configuration = dict(configuration or {})
+        debug_mode = int(cast(Any, configuration.pop('debug_mode', 0)))
+        return cls(debug_mode=debug_mode, **configuration)
 
-        def validate(self, *, shape, dtype, chunk_grid):
-            native_dtype = dtype.to_native_dtype() if hasattr(dtype, 'to_native_dtype') else dtype
-            if np.dtype(native_dtype) != np.dtype(np.uint16):
-                raise ValueError('ffmpeg codec only supports uint16 arrays')
-            if len(shape) < 2:
-                raise ValueError('ffmpeg codec expects arrays with at least 2 dimensions')
-            chunk_shape = getattr(chunk_grid, 'chunk_shape', None)
-            if chunk_shape is not None and len(tuple(chunk_shape)) < 2:
-                raise ValueError('ffmpeg codec expects chunk shapes with at least 2 dimensions')
+    def to_dict(self):
+        configuration = dict(self.conf)
+        if self.debug_mode != 0:
+            configuration['debug_mode'] = self.debug_mode
+        return {
+            'name': self.codec_name,
+            'configuration': configuration,
+        }
 
-        def _decode_sync(self, chunk_bytes, chunk_spec):
-            decoded = _decode_array_with_ffmpeg(
-                chunk_bytes.as_numpy_array().tobytes(),
-                self.dbg_print,
-                self.err_print,
-            )
-            return _array_to_chunk_bytes(decoded, chunk_spec)
+    def validate(self, *, shape, dtype, chunk_grid):
+        if _dtype_to_numpy_dtype(dtype) != np.dtype(np.uint16):
+            raise ValueError('ffmpeg codec only supports uint16 arrays')
+        if len(shape) < 2:
+            raise ValueError('ffmpeg codec expects arrays with at least 2 dimensions')
+        chunk_shape = getattr(chunk_grid, 'chunk_shape', None)
+        if chunk_shape is not None and len(tuple(chunk_shape)) < 2:
+            raise ValueError('ffmpeg codec expects chunk shapes with at least 2 dimensions')
 
-        async def _decode_single(self, chunk_bytes, chunk_spec):
-            return self._decode_sync(chunk_bytes, chunk_spec)
+    def _decode_sync(self, chunk_bytes, chunk_spec):
+        decoded = _decode_array_with_ffmpeg(
+            chunk_bytes.as_numpy_array().tobytes(),
+            self.dbg_print,
+            self.err_print,
+        )
+        return _array_to_chunk_bytes(decoded, chunk_spec)
 
-        def _encode_sync(self, chunk_bytes, chunk_spec):
-            chunk_array = _chunk_bytes_to_array(chunk_bytes, chunk_spec)
-            encoded = _encode_array_with_ffmpeg(
-                chunk_array,
-                self.conf,
-                self.dbg_print,
-                self.err_print,
-            )
-            return chunk_spec.prototype.buffer.from_bytes(encoded)
+    async def _decode_single(self, chunk_bytes, chunk_spec):
+        return self._decode_sync(chunk_bytes, chunk_spec)
 
-        async def _encode_single(self, chunk_bytes, chunk_spec):
-            return self._encode_sync(chunk_bytes, chunk_spec)
+    def _encode_sync(self, chunk_bytes, chunk_spec):
+        chunk_array = _chunk_bytes_to_array(chunk_bytes, chunk_spec)
+        encoded = _encode_array_with_ffmpeg(
+            chunk_array,
+            self.conf,
+            self.dbg_print,
+            self.err_print,
+        )
+        return chunk_spec.prototype.buffer.from_bytes(encoded)
 
-        def compute_encoded_size(self, _input_byte_length, _chunk_spec):
-            raise NotImplementedError('ffmpeg codec has variable encoded size')
-else:
-    ffmpeg_codec_v3 = None
+    async def _encode_single(self, chunk_bytes, chunk_spec):
+        return self._encode_sync(chunk_bytes, chunk_spec)
 
-numcodecs.registry.register_codec(ffmpeg_codec)
-if register_zarr_codec is not None and ffmpeg_codec_v3 is not None:
-    register_zarr_codec(ffmpeg_codec_v3.codec_name, ffmpeg_codec_v3)
+    def compute_encoded_size(self, _input_byte_length, _chunk_spec):
+        raise NotImplementedError('ffmpeg codec has variable encoded size')
+
+register_numcodecs_codec(ffmpeg_codec)
+register_zarr_codec(ffmpeg_codec_v3.codec_name, ffmpeg_codec_v3)
 

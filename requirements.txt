@@ -2,6 +2,7 @@ tifffile[all]
 ffmpeg-python
 h5py
 zarr
+pytest
 zarrs
 tqdm
 pydantic

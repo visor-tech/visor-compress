@@ -12,25 +12,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, cast
 
 import zarr
+import numcodecs
 
-try:
-    import numcodecs
-except ImportError:
-    numcodecs = None
+from zarr import codecs as zarr_codecs
 
-try:
-    from zarr import codecs as zarr_codecs
-except ImportError:
-    zarr_codecs = None
-
-FFMPEG_IMPORT_ERROR = None
-ffmpeg_codec = None
-try:
-    from numcodecs_ffmpeg import ffmpeg_codec as _ffmpeg_codec
-except Exception as exc:  # pragma: no cover - environment-dependent import
-    FFMPEG_IMPORT_ERROR = exc
-else:
-    ffmpeg_codec = _ffmpeg_codec
+from numcodecs_ffmpeg import ffmpeg_codec, ffmpeg_codec_v3
 
 def parse_shape(text: str) -> tuple[int, ...]:
     parts = [part.strip() for part in text.lower().split("x") if part.strip()]
@@ -190,33 +176,18 @@ def ask_user_confirmation(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
-def require_numcodecs() -> Any:
-    if numcodecs is None:
-        raise RuntimeError("numcodecs is required for this operation")
-    return numcodecs
-
-
 def build_v2_compressor(name: str, codec_config: dict[str, Any]) -> Any:
     if name == "ffmpeg":
-        if ffmpeg_codec is None:
-            detail = (
-                f": {FFMPEG_IMPORT_ERROR}"
-                if FFMPEG_IMPORT_ERROR is not None
-                else ""
-            )
-            raise RuntimeError(f"ffmpeg compressor is unavailable{detail}")
         return ffmpeg_codec(**codec_config)
-    registry = require_numcodecs().registry
+    registry = cast(Any, numcodecs).registry
     return registry.get_codec({"id": name, **codec_config})
 
 
 def build_v3_compressors(
     name: str, codec_config: dict[str, Any]
 ) -> tuple[Any, ...]:
-    if zarr_codecs is None:
-        raise RuntimeError("zarr.codecs is not available in this environment")
     if name == "ffmpeg":
-        raise ValueError("ffmpeg compressor requires Zarr format 2 output")
+        return (ffmpeg_codec_v3(**codec_config),)
     codec_class = getattr(zarr_codecs, name)
     return (codec_class(**codec_config),)
 
