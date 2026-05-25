@@ -11,10 +11,13 @@ from itertools import product
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence, cast
 
-import zarr
 import numcodecs
+import zarr
+import zarrs
+zarr.config.set({"codec_pipeline.path": "zarrs.ZarrsCodecPipeline"})
 
 from zarr import codecs as zarr_codecs
+from zarr.core.chunk_key_encodings import DefaultChunkKeyEncoding
 
 from numcodecs_ffmpeg import ffmpeg_codec, ffmpeg_codec_v3
 
@@ -45,6 +48,14 @@ def parse_json_object(text: str) -> dict[str, Any]:
             "compressor options must decode to a JSON object"
         )
     return value
+
+
+def parse_chunk_key_separator(text: str) -> str:
+    if text not in (".", "/"):
+        raise argparse.ArgumentTypeError(
+            "chunk key separator must be '.' or '/'"
+        )
+    return text
 
 
 def format_shape(shape: Sequence[int] | None) -> str:
@@ -150,7 +161,39 @@ def get_array_compression(array: Any) -> Any:
     return getattr(array, "compressor", None)
 
 
-def format_compression(array: Any) -> str:
+def get_codec_name(codec: Any) -> str:
+    config_getter = getattr(codec, "get_config", None)
+    if callable(config_getter):
+        try:
+            config = cast(Callable[[], Any], config_getter)()
+        except Exception:
+            config = None
+        if isinstance(config, dict):
+            for key in ("id", "name", "codec_name"):
+                value = config.get(key)
+                if value is not None:
+                    return str(value)
+    codec_name = getattr(codec, "codec_name", None)
+    if codec_name is not None:
+        return str(codec_name)
+    return type(codec).__name__
+
+
+def format_compression_name(array: Any) -> str:
+    compression = get_array_compression(array)
+    if compression is None:
+        return "none"
+    if isinstance(compression, tuple):
+        if not compression:
+            return "none"
+        names = [get_codec_name(codec) for codec in compression]
+        if len(names) == 1:
+            return names[0]
+        return format_json(names)
+    return get_codec_name(compression)
+
+
+def format_compression_parameters(array: Any) -> str:
     compression = get_array_compression(array)
     if compression is None:
         return "none"
@@ -183,18 +226,42 @@ def build_v2_compressor(name: str, codec_config: dict[str, Any]) -> Any:
     return registry.get_codec({"id": name, **codec_config})
 
 
+def resolve_v3_codec_class(name: str) -> Callable[..., Any]:
+    codec = getattr(zarr_codecs, name, None)
+    if callable(codec):
+        return cast(Callable[..., Any], codec)
+
+    lowered_name = name.lower()
+    for attr_name in dir(zarr_codecs):
+        if attr_name.startswith("_") or attr_name.lower() != lowered_name:
+            continue
+        codec = getattr(zarr_codecs, attr_name)
+        if callable(codec):
+            return cast(Callable[..., Any], codec)
+
+    raise ValueError(f"unknown Zarr v3 compressor: {name}")
+
+
 def build_v3_compressors(
     name: str, codec_config: dict[str, Any]
 ) -> tuple[Any, ...]:
     if name == "ffmpeg":
         return (ffmpeg_codec_v3(**codec_config),)
-    codec_class = getattr(zarr_codecs, name)
+    codec_class = resolve_v3_codec_class(name)
     return (codec_class(**codec_config),)
 
 
 def build_requested_compression(
     name: str, codec_config: dict[str, Any], target_format: int
 ) -> Any:
+    if name == "none":
+        if codec_config:
+            raise ValueError(
+                "--compressor none does not accept --compressor-opt"
+            )
+        if target_format == 3:
+            return ()
+        return None
     if target_format == 3:
         return build_v3_compressors(name, codec_config)
     return build_v2_compressor(name, codec_config)
@@ -230,6 +297,7 @@ def create_destination_array(
     shard_shape: tuple[int, ...] | None,
     compression: Any,
     target_format: int,
+    chunk_key_separator: str,
     overwrite: bool,
 ) -> Any:
     if overwrite:
@@ -249,6 +317,9 @@ def create_destination_array(
         }
         if shard_shape is not None:
             create_kwargs["shards"] = shard_shape
+        create_kwargs["chunk_key_encoding"] = DefaultChunkKeyEncoding(
+            separator=chunk_key_separator
+        )
         filters = get_source_filters(src, get_zarr_format(src))
         if filters not in (None, (), []):
             create_kwargs["filters"] = filters
@@ -268,6 +339,7 @@ def create_destination_array(
         "compressor": compression,
         "store": str(dst_path),
         "zarr_format": 2,
+        "dimension_separator": chunk_key_separator,
         "overwrite": overwrite,
     }
     filters = get_source_filters(src, get_zarr_format(src))
@@ -298,6 +370,15 @@ def iter_chunk_slices(
         yield tuple(slices)
 
 
+def get_copy_step_shape(
+    chunk_shape: tuple[int, ...],
+    shard_shape: tuple[int, ...] | None,
+) -> tuple[int, ...]:
+    if shard_shape is not None:
+        return shard_shape
+    return chunk_shape
+
+
 def show(path_text: str) -> int:
     path = Path(path_text).expanduser().resolve()
     print(f"absolute path: {path}")
@@ -319,6 +400,7 @@ def show(path_text: str) -> int:
 
     chunk_shape = get_array_chunks(node)
     shard_shape = get_array_shards(node)
+    zarr_format = get_zarr_format(node)
     nbytes = int(getattr(node, "nbytes"))
     stored_bytes = get_nbytes_stored(node)
     if stored_bytes is None:
@@ -326,6 +408,7 @@ def show(path_text: str) -> int:
     ratio = float("inf") if stored_bytes == 0 else nbytes / stored_bytes
 
     print("ZARR_ARRAY")
+    print(f"zarr format: {zarr_format}")
     print(f"shape: {format_shape(node.shape)}")
     print(f"chunk size: {format_shape(chunk_shape)}")
     if shard_shape is not None:
@@ -334,7 +417,10 @@ def show(path_text: str) -> int:
     print(f"number of bytes in storage: {stored_bytes}")
     print(f"number of bytes non-compressed: {nbytes}")
     print(f"compression ratio: {ratio:.6g}")
-    print(f"compression algorithm and parameters: {format_compression(node)}")
+    print(f"compressor name: {format_compression_name(node)}")
+    print(
+        f"compressor parameters: {format_compression_parameters(node)}"
+    )
     return 0
 
 
@@ -392,14 +478,17 @@ def rechunk(args: argparse.Namespace) -> int:
         shard_shape=shard_shape,
         compression=compression,
         target_format=target_format,
+        chunk_key_separator=args.chunk_key_separator,
         overwrite=args.overwrite,
     )
     copy_attributes(src, dst)
 
-    copied_chunks = 0
-    for slices in iter_chunk_slices(src.shape, chunk_shape):
+    copy_step_shape = get_copy_step_shape(chunk_shape, shard_shape)
+
+    copied_steps = 0
+    for slices in iter_chunk_slices(src.shape, copy_step_shape):
         dst[slices] = src[slices]
-        copied_chunks += 1
+        copied_steps += 1
 
     print(f"source: {src_path}")
     print(f"destination: {dst_path}")
@@ -414,7 +503,7 @@ def rechunk(args: argparse.Namespace) -> int:
         else "none"
     )
     print(f"compression algorithm and parameters: {compression_text}")
-    print(f"copied destination chunks: {copied_chunks}")
+    print(f"copied write steps: {copied_steps}")
     return 0
 
 
@@ -448,7 +537,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--compressor",
         help=(
             "Exact compressor name understood by the current Zarr or "
-            "numcodecs runtime, or ffmpeg"
+            "numcodecs runtime, ffmpeg, or 'none' for uncompressed output. "
+            "For Zarr v3 native codecs, use the class names exported by "
+            "zarr.codecs, such as ZstdCodec or GzipCodec."
         ),
     )
     rechunk_parser.add_argument(
@@ -463,6 +554,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Destination Zarr format. Defaults to the source format, except "
             "shard-size upgrades to v3."
+        ),
+    )
+    rechunk_parser.add_argument(
+        "--chunk-key-separator",
+        type=parse_chunk_key_separator,
+        default="/",
+        help=(
+            "Destination chunk key separator for output arrays: '/' or '.'. "
+            "Defaults to '/'."
         ),
     )
     rechunk_parser.add_argument(
