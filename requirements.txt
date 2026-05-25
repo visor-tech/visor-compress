@@ -1,0 +1,10 @@
+tifffile[all]
+ffmpeg-python
+h5py
+zarr
+zarrs
+tqdm
+pydantic
+numpy
+matplotlib
+dask

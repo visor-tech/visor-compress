@@ -4,7 +4,7 @@
 #
 # pip install ffmpeg-python   # not ffmpeg, not python-ffmpeg
 #
-# Usage with zarr:
+# Usage with zarr (v2):
 #    import numcodecs
 #    from numcodecs_ffmpeg import ffmpeg_codec
 #    import zarr
@@ -20,6 +20,148 @@ import re
 import numpy as np
 import numcodecs
 import ffmpeg
+
+ZARR_V3_IMPORT_ERROR = None
+BytesBytesCodec = None
+try:
+    from zarr.abc.codec import BytesBytesCodec
+    from zarr.core.common import parse_named_configuration
+    from zarr.registry import register_codec as register_zarr_codec
+except Exception as exc:  # pragma: no cover - environment-dependent import
+    ZARR_V3_IMPORT_ERROR = exc
+    parse_named_configuration = None
+    register_zarr_codec = None
+
+
+def _build_debug_hooks(debug_mode):
+    if debug_mode >= 1:
+        dbg_print = lambda *p: print(*p)
+    else:
+        dbg_print = lambda *p: None
+    if debug_mode >= 0:
+        err_print = lambda *p: print(*p, file=sys.stderr)
+    else:
+        err_print = lambda *p: None
+    return dbg_print, err_print
+
+
+def _normalize_chunk_array(buf):
+    if not isinstance(buf, np.ndarray):
+        raise TypeError(f"expected numpy.ndarray, got {type(buf)!r}")
+    if buf.dtype != np.uint16:
+        raise TypeError(f"expected uint16 array, got {buf.dtype!r}")
+    if buf.ndim < 2:
+        raise ValueError("ffmpeg codec expects at least 2 dimensions")
+    if buf.ndim > 3 and np.any(np.asarray(buf.shape[:-3]) != 1):
+        raise ValueError(
+            "ffmpeg codec only supports 2D/3D chunks or leading singleton dimensions"
+        )
+    return buf.reshape([-1, *buf.shape[-2:]])
+
+
+def _extract_video_shape(info_text):
+    matches = re.findall(r"(\d+)x(\d+)", info_text)
+    if not matches:
+        raise ValueError("failed to parse decoded frame size from ffmpeg output")
+    width, height = tuple(map(int, matches[0]))
+    return width, height
+
+
+def _collect_ffmpeg_warnings(info_text):
+    warnings = re.findall(r".*arning.*", info_text)
+    warnings.extend(re.findall(r".*ncompatible.*", info_text))
+    return warnings
+
+
+def _encode_array_with_ffmpeg(buf, conf, dbg_print, err_print):
+    chunk_array = _normalize_chunk_array(buf)
+    dbg_print('dbg: encode', type(buf), buf.shape)
+
+    height, width = chunk_array.shape[1:]
+    encoded, info = (
+        ffmpeg
+        .input('pipe:',
+               s       = f'{width}x{height}',
+               pix_fmt = 'gray16le',
+               format  = 'rawvideo',
+               r       = 25,
+              )
+        .output('pipe:', f='rawvideo', **conf)
+        .run(input=chunk_array.tobytes(),
+             capture_stdout=True,
+             capture_stderr=True,
+             quiet=False)
+    )
+
+    info_text = info.decode('utf-8')
+    dbg_print(info_text)
+
+    warning_lines = _collect_ffmpeg_warnings(info_text)
+    if warning_lines:
+        err_print('\n'.join(warning_lines))
+
+    return encoded
+
+
+def _decode_array_with_ffmpeg(buf, dbg_print, err_print):
+    if isinstance(buf, bytearray):
+        buf = bytes(buf)
+    elif not isinstance(buf, bytes):
+        buf = bytes(buf)
+
+    dbg_print('dbg: decode', type(buf), 'len =', len(buf))
+
+    decoded, info = (
+        ffmpeg
+        .input('pipe:')
+        .output('pipe:', format='rawvideo', pix_fmt='gray16le')
+        .run(input=buf, capture_stdout=True, capture_stderr=True)
+    )
+
+    info_text = info.decode('utf-8')
+    dbg_print(info_text)
+
+    warning_lines = _collect_ffmpeg_warnings(info_text)
+    if warning_lines:
+        err_print('\n'.join(warning_lines))
+
+    width, height = _extract_video_shape(info_text)
+    return np.frombuffer(decoded, np.uint16).reshape([-1, height, width])
+
+
+def _chunk_spec_to_numpy_dtype(chunk_spec):
+    dtype = getattr(chunk_spec, 'dtype', None)
+    if hasattr(dtype, 'to_native_dtype'):
+        dtype = dtype.to_native_dtype()
+    return np.dtype(dtype)
+
+
+def _chunk_spec_shape(chunk_spec):
+    return tuple(int(value) for value in chunk_spec.shape)
+
+
+def _chunk_bytes_to_array(chunk_bytes, chunk_spec):
+    dtype = _chunk_spec_to_numpy_dtype(chunk_spec)
+    raw = chunk_bytes.as_numpy_array().view(dtype=dtype)
+    shape = _chunk_spec_shape(chunk_spec)
+    expected_size = int(np.prod(shape, dtype=np.int64))
+    if raw.size != expected_size:
+        raise ValueError(
+            f"chunk byte size does not match shape {shape} and dtype {dtype}"
+        )
+    return raw.reshape(shape)
+
+
+def _array_to_chunk_bytes(chunk_array, chunk_spec):
+    shape = _chunk_spec_shape(chunk_spec)
+    if chunk_array.shape != shape:
+        expected_size = int(np.prod(shape, dtype=np.int64))
+        if chunk_array.size != expected_size:
+            raise ValueError(
+                f"decoded chunk shape {chunk_array.shape} is incompatible with expected {shape}"
+            )
+        chunk_array = chunk_array.reshape(shape)
+    return chunk_spec.prototype.buffer.from_bytes(chunk_array.tobytes(order='C'))
 
 class ffmpeg_codec(numcodecs.abc.Codec):
     """
@@ -95,93 +237,34 @@ class ffmpeg_codec(numcodecs.abc.Codec):
         if kwargs:
             self.conf.update(kwargs)
         self.debug_mode = debug_mode  # -1:suppress all output, 0:only warning, 1:show all
-        if self.debug_mode >= 1:
-            self.dbg_print = lambda *p: print(*p)
-        else:
-            self.dbg_print = lambda *p: None
-        if self.debug_mode >= 0:
-            self.err_print = lambda *p: print(*p, file = sys.stderr)
-        else:
-            self.err_print = lambda *p: None
+        self.dbg_print, self.err_print = _build_debug_hooks(self.debug_mode)
     
     def encode(self, buf):
         # Assume `buf` a numpy.ndarray
         # Return "compressed data"
-        self.dbg_print('dbg: encode', type(buf), buf.shape)
-        assert isinstance(buf, np.ndarray)
-        assert buf.dtype == np.uint16
-
-        assert buf.ndim == 3 or not np.any(buf.shape[:-3] - np.array(1))
-        # leave only the three right most dimensions
-        buf = buf.reshape([-1, *buf.shape[-2:]])
-
-        # encode numpy array to video stream
-        height, width = buf.shape[1:]
-        en_buf, info = (
-            ffmpeg
-            .input('pipe:',
-                   s       = f'{width}x{height}',
-                   pix_fmt = 'gray16le',
-                   format  = 'rawvideo',
-                   r       = 25,
-                  )
-            .output('pipe:', f='rawvideo', **self.conf)
-            .run(input = buf.tobytes(),
-                 capture_stdout = True,
-                 capture_stderr = True,
-                 quiet = False)
+        return _encode_array_with_ffmpeg(
+            buf,
+            self.conf,
+            self.dbg_print,
+            self.err_print,
         )
-
-        self.dbg_print(info.decode('utf-8'))
-
-        # print warnings
-        err_pick = re.findall(r".*arning.*", info.decode('utf-8'))
-        err_pick.extend(re.findall(r".*ncompatible.*", info.decode('utf-8')))
-        if err_pick:
-            self.err_print('\n'.join(err_pick))
-
-        return en_buf
         
     def decode(self, buf, out = None):
-        self.dbg_print('dbg: decode', type(buf), 'len =', len(buf))
-        assert type(buf) == bytes
-
-        # video stream to raw array bytes
-        de_buf, info = (
-            ffmpeg
-            .input('pipe:')
-            .output('pipe:', format = 'rawvideo', pix_fmt = 'gray16le')
-            .run(input = buf, capture_stdout = True, capture_stderr = True)
-        )
-
-        self.dbg_print(info.decode('utf-8'))
-
-        # print warnings
-        err_pick = re.findall(r".*arning.*", info.decode('utf-8'))
-        if err_pick:
-            self.err_print('\n'.err_pick)
-        
-        # find array dimension from message
-        ma = re.findall(r"(\d+)x(\d+)", info.decode('utf-8'))
-        width, height = tuple(map(int, ma[0]))
-
-        # Raw array bytes to numpy array
-        b = (
-            np
-            .frombuffer(de_buf, np.uint16)
-            .reshape([-1, height, width])
-        )
+        b = _decode_array_with_ffmpeg(buf, self.dbg_print, self.err_print)
         out = b
 
         return b
     
     def get_config(self):
-        self.conf.update(id = ffmpeg_codec.codec_id)
-        return self.conf
+        conf = dict(self.conf)
+        conf.update(id = ffmpeg_codec.codec_id)
+        return conf
     
     @classmethod
     def from_config(cls, conf):
         c = cls()
+        conf = dict(conf)
+        conf.pop('id', None)
         c.conf.update(conf)
         #leave only known options
         #for k in c.conf:
@@ -189,5 +272,81 @@ class ffmpeg_codec(numcodecs.abc.Codec):
         #        c.conf[k] = conf[k]
         return c
 
+
+if BytesBytesCodec is not None:
+    class ffmpeg_codec_v3(BytesBytesCodec):
+        """Zarr v3 bytes-to-bytes codec wrapping the FFmpeg chunk transform."""
+
+        codec_name = "ffmpeg"
+        is_fixed_size = False
+
+        def __init__(self, *, debug_mode=0, **kwargs):
+            self.conf = dict(ffmpeg_codec().conf)
+            if kwargs:
+                self.conf.update(kwargs)
+            self.debug_mode = debug_mode
+            self.dbg_print, self.err_print = _build_debug_hooks(self.debug_mode)
+
+        @classmethod
+        def from_dict(cls, data):
+            _, configuration = parse_named_configuration(
+                data,
+                cls.codec_name,
+                require_configuration=False,
+            )
+            configuration = dict(configuration or {})
+            debug_mode = int(configuration.pop('debug_mode', 0))
+            return cls(debug_mode=debug_mode, **configuration)
+
+        def to_dict(self):
+            configuration = dict(self.conf)
+            if self.debug_mode != 0:
+                configuration['debug_mode'] = self.debug_mode
+            return {
+                'name': self.codec_name,
+                'configuration': configuration,
+            }
+
+        def validate(self, *, shape, dtype, chunk_grid):
+            native_dtype = dtype.to_native_dtype() if hasattr(dtype, 'to_native_dtype') else dtype
+            if np.dtype(native_dtype) != np.dtype(np.uint16):
+                raise ValueError('ffmpeg codec only supports uint16 arrays')
+            if len(shape) < 2:
+                raise ValueError('ffmpeg codec expects arrays with at least 2 dimensions')
+            chunk_shape = getattr(chunk_grid, 'chunk_shape', None)
+            if chunk_shape is not None and len(tuple(chunk_shape)) < 2:
+                raise ValueError('ffmpeg codec expects chunk shapes with at least 2 dimensions')
+
+        def _decode_sync(self, chunk_bytes, chunk_spec):
+            decoded = _decode_array_with_ffmpeg(
+                chunk_bytes.as_numpy_array().tobytes(),
+                self.dbg_print,
+                self.err_print,
+            )
+            return _array_to_chunk_bytes(decoded, chunk_spec)
+
+        async def _decode_single(self, chunk_bytes, chunk_spec):
+            return self._decode_sync(chunk_bytes, chunk_spec)
+
+        def _encode_sync(self, chunk_bytes, chunk_spec):
+            chunk_array = _chunk_bytes_to_array(chunk_bytes, chunk_spec)
+            encoded = _encode_array_with_ffmpeg(
+                chunk_array,
+                self.conf,
+                self.dbg_print,
+                self.err_print,
+            )
+            return chunk_spec.prototype.buffer.from_bytes(encoded)
+
+        async def _encode_single(self, chunk_bytes, chunk_spec):
+            return self._encode_sync(chunk_bytes, chunk_spec)
+
+        def compute_encoded_size(self, _input_byte_length, _chunk_spec):
+            raise NotImplementedError('ffmpeg codec has variable encoded size')
+else:
+    ffmpeg_codec_v3 = None
+
 numcodecs.registry.register_codec(ffmpeg_codec)
+if register_zarr_codec is not None and ffmpeg_codec_v3 is not None:
+    register_zarr_codec(ffmpeg_codec_v3.codec_name, ffmpeg_codec_v3)
 
