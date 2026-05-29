@@ -236,6 +236,64 @@ def test_rechunk_allows_no_compression_for_v2(
 	assert metadata["compressor"] is None
 
 
+def test_rechunk_v2_to_v3_blosc_defaults_matches_fresh_v3_metadata(
+	tmp_path: Path,
+) -> None:
+	rng = np.random.default_rng(20260526)
+	data = rng.integers(
+		0,
+		65535,
+		size=(1, 1, 32, 40, 48),
+		dtype=np.uint16,
+	)
+
+	v2_path = tmp_path / "rnd_v2.zarr"
+	fresh_v3_path = tmp_path / "rnd_v3.zarr"
+	rechunked_v3_path = tmp_path / "rnd_v2_rechunk_v3.zarr"
+
+	v2 = cast(Any, zarr.open(
+		str(v2_path),
+		mode="w",
+		shape=data.shape,
+		chunks=(1, 1, 16, 20, 24),
+		dtype=data.dtype,
+		compressor=NUMCODECS_REGISTRY.get_codec({"id": "blosc"}),
+		zarr_format=2,
+	))
+	v2[:] = data
+
+	fresh_v3 = cast(Any, zarr.create_array(
+		str(fresh_v3_path),
+		shape=data.shape,
+		chunks=(1, 1, 16, 20, 24),
+		dtype=data.dtype,
+		compressors=build_requested_compression("BloscCodec", {}, 3),
+		zarr_format=3,
+		overwrite=True,
+	))
+	fresh_v3[:] = data
+
+	exit_code = main([
+		"rechunk",
+		str(v2_path),
+		str(rechunked_v3_path),
+		"--zarr-format",
+		"3",
+		"--compressor",
+		"BloscCodec",
+		"--overwrite",
+		"--yes",
+	])
+
+	rechunked_v3 = cast(Any, zarr.open(str(rechunked_v3_path), mode="r"))
+	fresh_meta = json.loads((fresh_v3_path / "zarr.json").read_text())
+	rechunked_meta = json.loads((rechunked_v3_path / "zarr.json").read_text())
+
+	assert exit_code == 0
+	assert np.array_equal(np.asarray(fresh_v3[:]), np.asarray(rechunked_v3[:]))
+	assert fresh_meta == rechunked_meta
+
+
 def test_rechunk_help_mentions_none_compressor(
 	capsys: pytest.CaptureFixture[str]
 ) -> None:
